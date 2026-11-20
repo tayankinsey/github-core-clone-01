@@ -82,7 +82,10 @@ function objectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(`${type} ${size}\0`);
 }
 
+const treeViewCache = new WeakMap<Uint8Array, TreeEntry[]>();
 function parseTree(data: Uint8Array): TreeEntry[] {
+  const cached = treeViewCache.get(data);
+  if (cached) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -99,6 +102,7 @@ function parseTree(data: Uint8Array): TreeEntry[] {
     offset += 20;
     entries.push({ mode, name, oid });
   }
+  treeViewCache.set(data, entries);
   return entries;
 }
 
@@ -113,7 +117,10 @@ function buildTree(entries: readonly TreeEntry[]): Buffer {
   return Buffer.concat(parts);
 }
 
+const commitViewCache = new WeakMap<Uint8Array, CommitView>();
 function parseCommit(data: Uint8Array): CommitView {
+  const cached = commitViewCache.get(data);
+  if (cached) return cached;
   const text = data.toString('utf8');
   const lines = text.split('\n');
   const parents: string[] = [];
@@ -130,7 +137,9 @@ function parseCommit(data: Uint8Array): CommitView {
     else if (line === '') { messageStart = i + 1; break; }
   }
   const message = lines.slice(messageStart).join('\n');
-  return { tree, parents, author, committer, message };
+  const view = { tree, parents, author, committer, message };
+  commitViewCache.set(data, view);
+  return view;
 }
 
 function buildCommit(fields: {
@@ -349,12 +358,12 @@ function writePack(objects: Iterable<GitObjectInput>): Buffer {
   new DataView(header.buffer).setUint32(4, 2); // version 2
   new DataView(header.buffer).setUint32(8, objArray.length);
   const parts: Buffer[] = [header];
+  const typeCodes: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
   for (const obj of objArray) {
-    const typeCodes: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
     const typeCode = typeCodes[obj.type];
     // Compress raw content directly (client's readPack expects raw content to compute correct OID)
-    const compressed = zlib.deflateSync(obj.data);
+    const compressed = zlib.deflateSync(obj.data, { level: 1 });
     // Write type+size header (packfile format: bit 7 of first byte = continuation, bits 6-4 = type, bits 3-0 = size_low)
     let size = obj.data.length;
     let firstByte = (typeCode << 4) | (size & 0xf);
@@ -460,6 +469,25 @@ export class Repository {
 
   reachable(tips: Iterable<string>): Set<string> {
     return collectReachable(tips, (oid) => this.objects.get(oid));
+  }
+
+  // Commit-only ancestry with early exit: fast-forward checks need only the
+  // commit DAG, not trees/blobs, and stop the moment the ancestor is found.
+  isAncestor(tip: string, ancestor: string): boolean {
+    if (tip === ancestor) return true;
+    const visited = new Set<string>();
+    const stack: string[] = [tip];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (oid === ancestor) return true;
+      if (visited.has(oid)) continue;
+      visited.add(oid);
+      const obj = this.objects.get(oid);
+      if (!obj || obj.type !== 'commit') continue;
+      const commit = parseCommit(obj.data);
+      for (const parent of commit.parents) stack.push(parent);
+    }
+    return false;
   }
 
   hasRef(name: string): boolean {

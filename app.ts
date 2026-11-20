@@ -38,11 +38,22 @@ const GIT_RECEIVE_PACK_TYPE = 'application/x-git-receive-pack-result';
 const GIT_RECEIVE_PACK_ADVERTISEMENT_TYPE = 'application/x-git-receive-pack-advertisement';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(JSON.stringify(body) + '\n');
   const requestId = headers['x-github-request-id'] || randomId();
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': requestId, ...headers });
-  res.end(text);
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, 'x-github-request-id': requestId, ...headers });
+  res.end(buf);
 }
+
+// Pre-serialized body path: skips JSON.stringify + byteLength on hot repeated reads.
+function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, headers: Record<string, string> = {}): void {
+  const requestId = headers['x-github-request-id'] || randomId();
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, 'x-github-request-id': requestId, ...headers });
+  res.end(buf);
+}
+
+// Cached GET /issues/{number} body, keyed by the stored issue object. The only
+// in-place mutation of an issue is PATCH, which deletes its entry here.
+const issueRespCache = new WeakMap<object, Buffer>();
 
 function sendBytes(res: ServerResponse, status: number, data: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': data.length });
@@ -75,7 +86,7 @@ function pathOf(req: IncomingMessage): string {
 function randomId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return Buffer.from(bytes).toString('hex');
 }
 
 // Global state
@@ -445,8 +456,6 @@ async function handleFetch(r: Repository, res: ServerResponse, packets: { kind: 
   let deepen = 0;
   let depth = 0;
 
-  const fs = await import('fs');
-
   for (const pkt of packets) {
     if (pkt.kind !== 'data') continue;
     const text = pkt.payload.toString('utf8').trim();
@@ -555,12 +564,6 @@ async function handleFetch(r: Repository, res: ServerResponse, packets: { kind: 
 
   const pack = writePack(objectsToSend);
 
-  // Debug logging to file
-  for (const obj of objectsToSend) {
-    if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
-    }
-  }
   const progressMsg = `Enumerating objects: ${objectsToSend.length}, done.\nCounting objects: ${objectsToSend.length}, done.\nCompressing objects: 100% (${objectsToSend.length}/${objectsToSend.length}), done.\nTotal ${objectsToSend.length} (delta 0), reused 0 (delta 0), pack-reused 0\n`;
 
   // Section: acknowledgments
@@ -701,9 +704,8 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, owne
         continue;
       }
 
-      // Check if newOid is descendant of oldOid
-      const reachable = r.reachable([newOid]);
-      if (!reachable.has(oldOid)) {
+      // Check if newOid is descendant of oldOid (commit-only, early exit)
+      if (!r.isAncestor(newOid, oldOid)) {
         reportRefs.push({ ref, ok: false, reason: 'non-fast-forward' });
         continue;
       }
@@ -1126,13 +1128,19 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       if (segments[6] !== undefined) {
         const issue = items.find(item => item.number === issueNumber);
         if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return; }
-        const issueWithId = { ...issue, id: toGlobalId('Issue', `${key}/${issue.number}`) };
-        if (method === 'GET') sendJson(res, 200, issueWithId, { 'x-github-request-id': randomId() });
-        else if (method === 'PATCH' && isOwner) {
+        if (method === 'GET') {
+          let buf = issueRespCache.get(issue);
+          if (!buf) {
+            buf = Buffer.from(JSON.stringify({ ...issue, id: toGlobalId('Issue', `${key}/${issue.number}`) }) + '\n');
+            issueRespCache.set(issue, buf);
+          }
+          sendJsonBuf(res, 200, buf);
+        } else if (method === 'PATCH' && isOwner) {
           const data = JSON.parse(body.toString('utf8'));
           if (data.state === 'open' || data.state === 'closed') issue.state = data.state;
           if (typeof data.title === 'string') issue.title = data.title;
           if (typeof data.body === 'string') issue.body = data.body;
+          issueRespCache.delete(issue);
           sendJson(res, 200, { ...issue, id: toGlobalId('Issue', `${key}/${issue.number}`) }, { 'x-github-request-id': randomId() });
         } else sendJson(res, 404, { message: 'Not Found' });
         return;
