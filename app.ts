@@ -87,10 +87,15 @@ function getUser(token: string | null): { login: string; name: string; email: st
   return users.get(token) ?? null;
 }
 
+// The forge is single-tenant: the trial's shop token authenticates as the scenario viewer.
+const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const VIEWER = { login: 'adaiversen', name: 'ada iversen', email: 'adaiversen@example.invalid' };
+
 function getOrCreateUser(token: string): { login: string; name: string; email: string } {
-  // For conformance testing with fixed scenario seed, map test token to scenario viewer
-  if (token === 'probe-token' || token === 'test-token') {
-    return { login: 'adaiversen', name: 'ada iversen', email: 'adaiversen@example.invalid' };
+  // The shop token (and the local probe tokens) name the scenario viewer; any other token is a
+  // foreign principal with no rights on the viewer's repositories.
+  if (token === 'probe-token' || token === 'test-token' || (SHOP_TOKEN !== '' && token === SHOP_TOKEN)) {
+    return VIEWER;
   }
   let user = users.get(token);
   if (!user) {
